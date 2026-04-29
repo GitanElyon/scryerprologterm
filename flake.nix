@@ -41,7 +41,6 @@
           buildInputs = with pkgs; [
             rust
             nodejs_20
-            scryer-prolog
             pkg-config
             gobject-introspection
             curl
@@ -53,7 +52,6 @@
             export XDG_DATA_DIRS="${pkgs.gsettings-desktop-schemas}/share/gsettings-schemas/${pkgs.gsettings-desktop-schemas.name}:${pkgs.gtk3}/share/gsettings-schemas/${pkgs.gtk3.name}:$XDG_DATA_DIRS"
             echo "Dev environment ready!"
             echo "Run: npm install && npm tauri dev"
-            echo "Scryer: $(command -v scryer-prolog)"
           '';
         };
       }

@@ -7,7 +7,7 @@ scryerprologterm is a desktop Prolog terminal for Scryer Prolog. It is meant for
 The app is built from two cooperating pieces:
 
 - A Vue frontend that renders the terminal output, input composer, and command feedback.
-- A Rust Tauri backend that launches Scryer Prolog, manages temporary source files, and keeps session state in memory.
+- A Rust Tauri backend that embeds Scryer Prolog in-process and keeps session state in memory.
 
 ## Core Behavior
 
@@ -17,7 +17,7 @@ The app supports three primary workflows:
 2. Load a block of facts and rules into the current session.
 3. Mix rules and queries in the same pasted block.
 
-The backend does not keep a long-running Prolog interpreter alive. Instead, each submission starts a fresh `scryer-prolog` process with the current session knowledge preloaded from memory. This keeps execution isolated while still giving the appearance of a persistent terminal session.
+The backend does not keep a long-running Prolog interpreter alive. Instead, each submission creates a fresh embedded Scryer Prolog machine with the current session knowledge preloaded from memory. This keeps execution isolated while still giving the appearance of a persistent terminal session.
 
 ## Input Model
 
@@ -86,10 +86,10 @@ The backend classifies a submission in a few steps:
 
 Query execution uses this pattern:
 
-1. Build a temporary Prolog source file from the current session knowledge.
-2. Launch `scryer-prolog` with that file.
-3. Pipe one or more goals to stdin as `once((Goal)).`
-4. Send `halt.` so the process exits cleanly.
+1. Build a fresh embedded Scryer Prolog machine.
+2. Consult the current session knowledge into the machine.
+3. Run one or more goals as `once((Goal)).`
+4. Flush the machine output streams and collect the resulting text.
 
 Wrapping goals with `once/1` avoids non-deterministic backtracking prompts and keeps the terminal responsive.
 
@@ -163,7 +163,6 @@ can_the_bird_fly(sparrow).
 
 ## Development Notes
 
-- The app expects `scryer-prolog` to be available in the Nix dev shell.
 - `nix develop` should provide the full frontend and backend toolchain.
 - `npm tauri dev` runs the full desktop app during development.
 

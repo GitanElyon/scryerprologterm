@@ -8,6 +8,8 @@ This app gives you a small terminal-like interface for running Scryer Prolog goa
 
 The app keeps an in-memory session knowledge base while it is open. That means you can load facts and rules once, then run later queries against the same session without re-pasting everything.
 
+The backend embeds the `scryer-prolog` crate directly, so queries run inside the app process instead of shelling out to an external `scryer-prolog` binary.
+
 ## Run
 
 1. Enter the Nix development shell:
@@ -25,7 +27,7 @@ npm install
 3. Start the app:
 
 ```bash
-npm tauri dev
+npm run tauri dev
 ```
 
 ## Quick Use
@@ -92,6 +94,6 @@ The textbox treats `?- goal.` as a normal Prolog query. Queries are wrapped with
 ## Notes
 
 - The terminal keeps an in-memory session knowledge base and reuses it on later queries.
-- Each execution still runs in a fresh `scryer-prolog` process with the current session knowledge preloaded.
+- Each execution runs against a fresh embedded Scryer Prolog machine with the current session knowledge preloaded.
 - Query execution wraps goals as `once((Goal))` to avoid interactive backtracking hangs.
-- `flake.nix` includes `scryer-prolog`, so it is available automatically inside `nix develop`.
+- `nix develop` still provides the frontend and Rust/Tauri toolchain, but the Prolog engine now comes from the Rust crate dependency.

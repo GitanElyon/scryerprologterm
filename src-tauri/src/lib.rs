@@ -1,9 +1,10 @@
-use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::cell::RefCell;
+use std::io::Cursor;
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::rc::Rc;
 use std::sync::{Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+
+use scryer_prolog::{LeafAnswer, Machine, MachineBuilder, StreamConfig, Term};
 
 #[derive(serde::Serialize)]
 struct PrologResponse {
@@ -157,6 +158,124 @@ where
     unique_values
 }
 
+fn make_capturing_streams() -> (StreamConfig, Rc<RefCell<Vec<u8>>>, Rc<RefCell<Vec<u8>>>) {
+    let stdout_buffer = Rc::new(RefCell::new(Vec::new()));
+    let stderr_buffer = Rc::new(RefCell::new(Vec::new()));
+
+    let stdout_capture: Box<dyn FnMut(&mut Cursor<Vec<u8>>)> = {
+        let stdout_buffer = Rc::clone(&stdout_buffer);
+
+        Box::new(move |cursor: &mut Cursor<Vec<u8>>| {
+            *stdout_buffer.borrow_mut() = cursor.get_ref().clone();
+        })
+    };
+
+    let stderr_capture: Box<dyn FnMut(&mut Cursor<Vec<u8>>)> = {
+        let stderr_buffer = Rc::clone(&stderr_buffer);
+
+        Box::new(move |cursor: &mut Cursor<Vec<u8>>| {
+            *stderr_buffer.borrow_mut() = cursor.get_ref().clone();
+        })
+    };
+
+    let (_, streams) = StreamConfig::from_callbacks(Some(stdout_capture), Some(stderr_capture));
+    (streams, stdout_buffer, stderr_buffer)
+}
+
+fn capture_buffer_delta(buffer: &Rc<RefCell<Vec<u8>>>, offset: &mut usize) -> String {
+    let borrowed = buffer.borrow();
+    let slice = borrowed.get(*offset..).unwrap_or(&[]);
+    *offset = borrowed.len();
+    String::from_utf8_lossy(slice).into_owned()
+}
+
+fn append_output(target: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+
+    if !target.is_empty() && !target.ends_with('\n') {
+        target.push('\n');
+    }
+
+    target.push_str(chunk);
+}
+
+fn format_atom(atom: &str) -> String {
+    let is_bare_atom = atom
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_lowercase())
+        && atom.chars().all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        });
+
+    if is_bare_atom {
+        atom.to_string()
+    } else {
+        format!("'{}'", atom.replace('\'', "''"))
+    }
+}
+
+fn format_term(term: &Term) -> String {
+    match term {
+        Term::Integer(value) => value.to_string(),
+        Term::Rational(value) => value.to_string(),
+        Term::Float(value) => value.to_string(),
+        Term::Atom(value) => format_atom(value),
+        Term::String(value) => format!("\"{}\"", value.escape_default()),
+        Term::List(items) => {
+            let formatted_items = items.iter().map(format_term).collect::<Vec<_>>().join(", ");
+            format!("[{}]", formatted_items)
+        }
+        Term::Compound(functor, arguments) => {
+            let formatted_arguments = arguments
+                .iter()
+                .map(format_term)
+                .collect::<Vec<_>>()
+                .join(", ");
+
+            if formatted_arguments.is_empty() {
+                format_atom(functor)
+            } else {
+                format!("{}({})", format_atom(functor), formatted_arguments)
+            }
+        }
+        Term::Var(value) => value.clone(),
+        _ => format!("{:?}", term),
+    }
+}
+
+fn format_leaf_answer(answer: Result<LeafAnswer, Term>) -> (Option<String>, bool) {
+    match answer {
+        Ok(LeafAnswer::True) => (Some("true.".to_string()), true),
+        Ok(LeafAnswer::False) => (Some("false.".to_string()), true),
+        Ok(LeafAnswer::Exception(term)) => (
+            Some(format!("Exception: {}", format_term(&term))),
+            false,
+        ),
+        Ok(LeafAnswer::LeafAnswer { bindings, .. }) => {
+            if bindings.is_empty() {
+                (Some("true.".to_string()), true)
+            } else {
+                let formatted_bindings = bindings
+                    .iter()
+                    .map(|(name, value)| format!("{} = {}", name, format_term(value)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+
+                (Some(formatted_bindings), true)
+            }
+        }
+        Err(term) => (Some(format!("Error: {}", format_term(&term))), false),
+    }
+}
+
+fn flush_machine_output(machine: &mut Machine) {
+    let mut flush_query = machine.run_query("flush_output.");
+    let _ = flush_query.next();
+}
+
 fn record_successful_inputs(state: &mut SessionState, inputs: Vec<String>) {
     for input in inputs {
         if !state.successful_inputs.contains(&input) {
@@ -180,71 +299,92 @@ fn parse_load_command(raw_input: &str) -> Option<String> {
     None
 }
 
-fn create_temp_program_path() -> Result<PathBuf, String> {
-    let mut path = std::env::temp_dir();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|error| format!("Failed to compute timestamp for temp file: {error}"))?
-        .as_nanos();
+fn run_scryer(knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
+    let (streams, stdout_buffer, stderr_buffer) = make_capturing_streams();
+    let mut machine = MachineBuilder::default().with_streams(streams).build();
+    let mut stdout = String::new();
+    let mut stderr = String::new();
+    let mut stdout_offset = 0;
+    let mut stderr_offset = 0;
+    let mut success = true;
 
-    path.push(format!(
-        "scryerprologterm-{}-{timestamp}.pl",
-        std::process::id()
-    ));
+    if !knowledge_blocks.is_empty() {
+        let consult_program = build_program_text(knowledge_blocks);
+        let consult_result = catch_unwind(AssertUnwindSafe(|| {
+            machine.consult_module_string("user", consult_program);
+        }));
 
-    Ok(path)
-}
-
-fn run_scryer(knowledge_blocks: &[String], goals: &[String]) -> Result<PrologExecution, String> {
-    let program_path = create_temp_program_path()?;
-    let program_text = build_program_text(knowledge_blocks);
-
-    fs::write(&program_path, program_text)
-        .map_err(|error| format!("Failed to create temporary Prolog source file: {error}"))?;
-
-    let program_path_text = program_path.to_string_lossy().to_string();
-
-    let mut child = Command::new("scryer-prolog")
-        .args(["-f", &program_path_text, "--no-add-history"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| {
-            let _ = fs::remove_file(&program_path);
-            format!(
-                "Failed to start scryer-prolog: {error}. Run `nix develop` to enter the dev shell."
-            )
-        })?;
-
-    {
-        let stdin = child
-            .stdin
-            .as_mut()
-            .ok_or_else(|| "Failed to open stdin for scryer-prolog".to_string())?;
-
-        for goal in goals {
-            writeln!(stdin, "once(({goal})).")
-                .map_err(|error| format!("Failed to send goal to scryer-prolog: {error}"))?;
+        if consult_result.is_err() {
+            return PrologExecution {
+                response: PrologResponse {
+                    stdout: String::new(),
+                    stderr: "Scryer Prolog panicked while loading the current session knowledge."
+                        .to_string(),
+                },
+                success: false,
+            };
         }
 
-        writeln!(stdin, "halt.")
-            .map_err(|error| format!("Failed to send halt command to scryer-prolog: {error}"))?;
+        flush_machine_output(&mut machine);
+        append_output(
+            &mut stdout,
+            &capture_buffer_delta(&stdout_buffer, &mut stdout_offset),
+        );
+        append_output(
+            &mut stderr,
+            &capture_buffer_delta(&stderr_buffer, &mut stderr_offset),
+        );
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|error| format!("Failed while waiting for scryer-prolog: {error}"))?;
+    for goal in goals {
+        let query_text = format!("once(({goal})).");
+        let query_result = catch_unwind(AssertUnwindSafe(|| {
+            let mut query = machine.run_query(query_text);
+            query.next().unwrap_or(Ok(LeafAnswer::False))
+        }));
 
-    let _ = fs::remove_file(&program_path);
+        let formatted_result = match query_result {
+            Ok(result) => format_leaf_answer(result),
+            Err(_) => (
+                Some(format!("Error: Scryer Prolog panicked while evaluating: {goal}")),
+                false,
+            ),
+        };
 
-    Ok(PrologExecution {
+        flush_machine_output(&mut machine);
+
+        append_output(
+            &mut stdout,
+            &capture_buffer_delta(&stdout_buffer, &mut stdout_offset),
+        );
+        append_output(
+            &mut stderr,
+            &capture_buffer_delta(&stderr_buffer, &mut stderr_offset),
+        );
+
+        if let Some(output_text) = formatted_result.0 {
+            if output_text.starts_with("Error:") || output_text.starts_with("Exception:") {
+                append_output(&mut stderr, &output_text);
+                success = false;
+            } else {
+                append_output(&mut stdout, &output_text);
+
+                if !formatted_result.1 {
+                    success = false;
+                }
+            }
+        } else {
+            success = false;
+        }
+    }
+
+    PrologExecution {
         response: PrologResponse {
-            stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            stdout: stdout.trim().to_string(),
+            stderr: stderr.trim().to_string(),
         },
-        success: output.status.success(),
-    })
+        success,
+    }
 }
 
 #[tauri::command]
@@ -340,7 +480,7 @@ fn run_prolog_query(query: String) -> Result<PrologResponse, String> {
             candidate_knowledge.push(knowledge_candidate.clone());
         }
 
-        let mut execution = run_scryer(&candidate_knowledge, &[])?;
+        let mut execution = run_scryer(&candidate_knowledge, &[]);
         if execution.success {
             if has_knowledge {
                 let mut state = session_state()
@@ -386,7 +526,7 @@ fn run_prolog_query(query: String) -> Result<PrologResponse, String> {
         candidate_knowledge.push(knowledge_candidate.clone());
     }
 
-    let execution = run_scryer(&candidate_knowledge, &goals)?;
+    let execution = run_scryer(&candidate_knowledge, &goals);
 
     if execution.success && has_knowledge {
         let mut state = session_state()
