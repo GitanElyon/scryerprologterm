@@ -84,6 +84,17 @@ fn looks_like_knowledge_block(raw_input: &str) -> bool {
     statement_lines >= 2
 }
 
+fn prolog_panic_response() -> PrologExecution {
+    PrologExecution {
+        response: PrologResponse {
+            stdout: String::new(),
+            stderr: "Error: Scryer Prolog panicked while executing the current submission."
+                .to_string(),
+        },
+        success: false,
+    }
+}
+
 fn build_program_text(knowledge_blocks: &[String]) -> String {
     let mut parts = Vec::new();
     for block in knowledge_blocks {
@@ -300,6 +311,13 @@ fn parse_load_command(raw_input: &str) -> Option<String> {
 }
 
 fn run_scryer(knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
+    match catch_unwind(AssertUnwindSafe(|| run_scryer_inner(knowledge_blocks, goals))) {
+        Ok(execution) => execution,
+        Err(_) => prolog_panic_response(),
+    }
+}
+
+fn run_scryer_inner(knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
     let (streams, stdout_buffer, stderr_buffer) = make_capturing_streams();
     let mut machine = MachineBuilder::default().with_streams(streams).build();
     let mut stdout = String::new();
@@ -463,39 +481,30 @@ fn run_prolog_query(query: String) -> Result<PrologResponse, String> {
     let knowledge_candidate = knowledge_text.trim().to_string();
     let has_knowledge = has_non_comment_content(&knowledge_candidate);
     let has_inline_queries = !inline_queries.is_empty();
+    let should_load_knowledge = is_force_load_mode
+        || load_mode_armed
+        || looks_like_knowledge_block(&knowledge_candidate);
 
-    let knowledge_only_submission =
-        is_force_load_mode || load_mode_armed || (!has_inline_queries && looks_like_knowledge_block(&raw_input));
+    let knowledge_only_submission = should_load_knowledge && !has_inline_queries;
 
     if knowledge_only_submission {
-        let existing_knowledge = {
-            let state = session_state()
-                .lock()
-                .map_err(|_| "Failed to acquire session lock".to_string())?;
-            state.knowledge_blocks.clone()
-        };
-
-        let mut candidate_knowledge = existing_knowledge;
-        if has_knowledge {
-            candidate_knowledge.push(knowledge_candidate.clone());
+        if !has_knowledge {
+            return Ok(PrologResponse {
+                stdout: "No clauses found to load.".to_string(),
+                stderr: String::new(),
+            });
         }
 
-        let mut execution = run_scryer(&candidate_knowledge, &[]);
+        let mut execution = run_scryer(&[knowledge_candidate.clone()], &[]);
         if execution.success {
-            if has_knowledge {
-                let mut state = session_state()
-                    .lock()
-                    .map_err(|_| "Failed to acquire session lock".to_string())?;
-                state.knowledge_blocks = candidate_knowledge;
-                state.load_mode_armed = false;
-                record_successful_inputs(&mut state, vec![knowledge_candidate.clone()]);
-            }
+            let mut state = session_state()
+                .lock()
+                .map_err(|_| "Failed to acquire session lock".to_string())?;
+            state.knowledge_blocks.push(knowledge_candidate.clone());
+            state.load_mode_armed = false;
+            record_successful_inputs(&mut state, vec![knowledge_candidate.clone()]);
 
-            let loaded_message = if has_knowledge {
-                "Clauses loaded successfully."
-            } else {
-                "No clauses found to load."
-            };
+            let loaded_message = "Clauses loaded successfully.";
 
             if execution.response.stdout.is_empty() {
                 execution.response.stdout = loaded_message.to_string();
@@ -522,17 +531,17 @@ fn run_prolog_query(query: String) -> Result<PrologResponse, String> {
     };
 
     let mut candidate_knowledge = existing_knowledge;
-    if has_knowledge {
+    if should_load_knowledge && has_knowledge {
         candidate_knowledge.push(knowledge_candidate.clone());
     }
 
     let execution = run_scryer(&candidate_knowledge, &goals);
 
-    if execution.success && has_knowledge {
+    if execution.success && should_load_knowledge && has_knowledge {
         let mut state = session_state()
             .lock()
             .map_err(|_| "Failed to acquire session lock".to_string())?;
-        state.knowledge_blocks = candidate_knowledge;
+        state.knowledge_blocks.push(knowledge_candidate.clone());
         state.load_mode_armed = false;
         record_successful_inputs(&mut state, vec![knowledge_candidate.clone()]);
     }
@@ -563,8 +572,13 @@ pub fn run() {
 mod tests {
     use super::{
         build_help_message, build_show_message_with_inputs, looks_like_knowledge_block,
-        normalize_goal, parse_load_command, split_inline_queries,
+        normalize_goal, parse_load_command, run_prolog_query, session_state, split_inline_queries,
     };
+
+    fn reset_session_state() {
+        let mut state = session_state().lock().expect("session lock");
+        *state = Default::default();
+    }
 
     #[test]
     fn normalizes_goal_prefix_and_trailing_dot() {
@@ -627,5 +641,25 @@ mod tests {
         assert!(message.contains("Successful inputs:"));
         assert_eq!(message.matches("bird(sparrow)." ).count(), 1);
         assert_eq!(message.matches("?- can_the_bird_fly(sparrow)." ).count(), 1);
+    }
+
+    #[test]
+    fn bare_equality_queries_stay_out_of_loaded_knowledge() {
+        reset_session_state();
+
+        let _response = run_prolog_query("1=1".to_string()).expect("bare equality should run");
+        let state = session_state().lock().expect("session lock");
+
+        assert!(state.knowledge_blocks.is_empty());
+    }
+
+    #[test]
+    fn malformed_queries_do_not_panic() {
+        reset_session_state();
+
+        let _ = run_prolog_query("foo(".to_string());
+        let state = session_state().lock().expect("session lock");
+
+        assert!(state.knowledge_blocks.is_empty());
     }
 }
