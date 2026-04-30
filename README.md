@@ -35,7 +35,7 @@ npm run tauri dev
 - Enter sends the current input.
 - Ctrl+Enter inserts a newline.
 - `:help` shows the command menu.
-- `:show` prints the currently loaded rules and successful inputs.
+- `:show` prints the currently loaded rules.
 - `:reset` clears the loaded session state.
 - `:clear` clears the screen output only.
 - `:load` arms the next submission as a load-only block.
@@ -85,15 +85,15 @@ The textbox treats `?- goal.` as a normal Prolog query. Queries are wrapped with
 
 `:load` behaves as a staging command. If you submit `:load` by itself, the next submission is treated as a load-only block. If you submit `:load <clauses>`, those clauses are loaded immediately.
 
-`:show` displays the loaded rules and successful inputs collected during the session.
+`:show` displays the loaded rules currently in the session knowledge base.
 
-`:reset` clears the session knowledge base and successful-input history.
+`:reset` clears the session knowledge base.
 
 `:clear` only clears the on-screen transcript.
 
 ## Notes
 
 - The terminal keeps an in-memory session knowledge base and reuses it on later queries.
-- Each execution runs against a fresh embedded Scryer Prolog machine with the current session knowledge preloaded.
+- The app keeps one warm embedded Scryer Prolog machine alive per session and loads new clauses into it incrementally.
 - Query execution wraps goals as `once((Goal))` to avoid interactive backtracking hangs.
 - `nix develop` still provides the frontend and Rust/Tauri toolchain, but the Prolog engine now comes from the Rust crate dependency.

@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{mpsc, OnceLock};
 
 use scryer_prolog::{LeafAnswer, Machine, MachineBuilder, StreamConfig, Term};
 
@@ -17,17 +17,36 @@ struct PrologExecution {
     success: bool,
 }
 
-#[derive(Default)]
-struct SessionState {
+struct SessionEngine {
+    machine: Machine,
+    stdout_buffer: Rc<RefCell<Vec<u8>>>,
+    stderr_buffer: Rc<RefCell<Vec<u8>>>,
+    stdout_offset: usize,
+    stderr_offset: usize,
     knowledge_blocks: Vec<String>,
-    successful_inputs: Vec<String>,
     load_mode_armed: bool,
 }
 
-static SESSION_STATE: OnceLock<Mutex<SessionState>> = OnceLock::new();
+enum WorkerRequest {
+    Run {
+        query: String,
+        reply: mpsc::Sender<Result<PrologResponse, String>>,
+    },
+}
 
-fn session_state() -> &'static Mutex<SessionState> {
-    SESSION_STATE.get_or_init(|| Mutex::new(SessionState::default()))
+static PROLOG_WORKER: OnceLock<mpsc::Sender<WorkerRequest>> = OnceLock::new();
+
+fn prolog_worker() -> &'static mpsc::Sender<WorkerRequest> {
+    PROLOG_WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<WorkerRequest>();
+
+        std::thread::Builder::new()
+            .name("scryer-prolog-worker".to_string())
+            .spawn(move || prolog_worker_loop(rx))
+            .expect("failed to start scryer prolog worker");
+
+        tx
+    })
 }
 
 fn normalize_goal(raw_goal: &str) -> Option<String> {
@@ -84,6 +103,18 @@ fn looks_like_knowledge_block(raw_input: &str) -> bool {
     statement_lines >= 2
 }
 
+fn build_show_message(knowledge_blocks: &[String]) -> String {
+    let unique_blocks = dedupe_preserving_order(knowledge_blocks.iter().cloned());
+
+    if unique_blocks.is_empty() {
+        return "No rules loaded.".to_string();
+    }
+
+    let mut section = String::from("Loaded rules and facts:\n\n");
+    section.push_str(&unique_blocks.join("\n\n"));
+    section
+}
+
 fn prolog_panic_response() -> PrologExecution {
     PrologExecution {
         response: PrologResponse {
@@ -92,22 +123,6 @@ fn prolog_panic_response() -> PrologExecution {
                 .to_string(),
         },
         success: false,
-    }
-}
-
-fn build_program_text(knowledge_blocks: &[String]) -> String {
-    let mut parts = Vec::new();
-    for block in knowledge_blocks {
-        let trimmed = block.trim();
-        if !trimmed.is_empty() {
-            parts.push(trimmed);
-        }
-    }
-
-    if parts.is_empty() {
-        "% empty knowledge base\n".to_string()
-    } else {
-        format!("{}\n", parts.join("\n\n"))
     }
 }
 
@@ -130,28 +145,6 @@ fn build_help_message() -> String {
         "  - Include ?- lines in a pasted block to load and query in one run.",
     ]
     .join("\n")
-}
-
-fn build_show_message_with_inputs(
-    knowledge_blocks: &[String],
-    successful_inputs: &[String],
-) -> String {
-    let unique_blocks = dedupe_preserving_order(knowledge_blocks.iter().cloned());
-    let unique_inputs = dedupe_preserving_order(successful_inputs.iter().cloned());
-
-    if unique_blocks.is_empty() && unique_inputs.is_empty() {
-        return "No rules loaded.".to_string();
-    }
-
-    let mut sections = Vec::new();
-
-    if !unique_blocks.is_empty() {
-        let mut section = String::from("Loaded rules and facts:\n\n");
-        section.push_str(&unique_blocks.join("\n\n"));
-        sections.push(section);
-    }
-
-    sections.join("\n\n")
 }
 
 fn dedupe_preserving_order<I>(values: I) -> Vec<String>
@@ -287,14 +280,6 @@ fn flush_machine_output(machine: &mut Machine) {
     let _ = flush_query.next();
 }
 
-fn record_successful_inputs(state: &mut SessionState, inputs: Vec<String>) {
-    for input in inputs {
-        if !state.successful_inputs.contains(&input) {
-            state.successful_inputs.push(input);
-        }
-    }
-}
-
 fn parse_load_command(raw_input: &str) -> Option<String> {
     let trimmed = raw_input.trim();
     let remainder = trimmed.strip_prefix(":load")?;
@@ -310,253 +295,273 @@ fn parse_load_command(raw_input: &str) -> Option<String> {
     None
 }
 
-fn run_scryer(knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
-    match catch_unwind(AssertUnwindSafe(|| run_scryer_inner(knowledge_blocks, goals))) {
-        Ok(execution) => execution,
-        Err(_) => prolog_panic_response(),
+impl SessionEngine {
+    fn new() -> Self {
+        let (streams, stdout_buffer, stderr_buffer) = make_capturing_streams();
+
+        Self {
+            machine: MachineBuilder::default().with_streams(streams).build(),
+            stdout_buffer,
+            stderr_buffer,
+            stdout_offset: 0,
+            stderr_offset: 0,
+            knowledge_blocks: Vec::new(),
+            load_mode_armed: false,
+        }
+    }
+
+    fn rebuild_machine(&mut self) {
+        let load_mode_armed = self.load_mode_armed;
+        let knowledge_blocks = self.knowledge_blocks.clone();
+
+        *self = Self::new();
+        self.knowledge_blocks = knowledge_blocks.clone();
+        self.load_mode_armed = load_mode_armed;
+
+        for block in knowledge_blocks {
+            let _ = self.run_scryer(&[block], &[]);
+        }
+
+        self.load_mode_armed = load_mode_armed;
+    }
+
+    fn run_scryer(&mut self, knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
+        let mut stdout = String::new();
+        let mut stderr = String::new();
+        let mut success = true;
+
+        if !knowledge_blocks.is_empty() {
+            for block in knowledge_blocks {
+                let consult_result = catch_unwind(AssertUnwindSafe(|| {
+                    self.machine.consult_module_string("user", block.clone());
+                }));
+
+                if consult_result.is_err() {
+                    return PrologExecution {
+                        response: PrologResponse {
+                            stdout: String::new(),
+                            stderr: "Scryer Prolog panicked while loading the current submission."
+                                .to_string(),
+                        },
+                        success: false,
+                    };
+                }
+
+                flush_machine_output(&mut self.machine);
+                append_output(
+                    &mut stdout,
+                    &capture_buffer_delta(&self.stdout_buffer, &mut self.stdout_offset),
+                );
+                append_output(
+                    &mut stderr,
+                    &capture_buffer_delta(&self.stderr_buffer, &mut self.stderr_offset),
+                );
+            }
+        }
+
+        for goal in goals {
+            let query_text = format!("once(({goal})).");
+            let query_result = catch_unwind(AssertUnwindSafe(|| {
+                let mut query = self.machine.run_query(query_text);
+                query.next().unwrap_or(Ok(LeafAnswer::False))
+            }));
+
+            let formatted_result = match query_result {
+                Ok(result) => format_leaf_answer(result),
+                Err(_) => (
+                    Some(format!("Error: Scryer Prolog panicked while evaluating: {goal}")),
+                    false,
+                ),
+            };
+
+            flush_machine_output(&mut self.machine);
+
+            append_output(
+                &mut stdout,
+                &capture_buffer_delta(&self.stdout_buffer, &mut self.stdout_offset),
+            );
+            append_output(
+                &mut stderr,
+                &capture_buffer_delta(&self.stderr_buffer, &mut self.stderr_offset),
+            );
+
+            if let Some(output_text) = formatted_result.0 {
+                if output_text.starts_with("Error:") || output_text.starts_with("Exception:") {
+                    append_output(&mut stderr, &output_text);
+                    success = false;
+                } else {
+                    append_output(&mut stdout, &output_text);
+
+                    if !formatted_result.1 {
+                        success = false;
+                    }
+                }
+            } else {
+                success = false;
+            }
+        }
+
+        PrologExecution {
+            response: PrologResponse {
+                stdout: stdout.trim().to_string(),
+                stderr: stderr.trim().to_string(),
+            },
+            success,
+        }
+    }
+
+    fn handle_query(&mut self, query: String) -> Result<PrologResponse, String> {
+        let mut raw_input = query.trim().to_string();
+        if raw_input.is_empty() {
+            return Err("Query is empty".to_string());
+        }
+
+        if raw_input.eq_ignore_ascii_case(":help") {
+            return Ok(PrologResponse {
+                stdout: build_help_message(),
+                stderr: String::new(),
+            });
+        }
+
+        if raw_input.eq_ignore_ascii_case(":show") {
+            return Ok(PrologResponse {
+                stdout: build_show_message(&self.knowledge_blocks),
+                stderr: String::new(),
+            });
+        }
+
+        if raw_input.eq_ignore_ascii_case(":clear") {
+            return Ok(PrologResponse {
+                stdout: String::new(),
+                stderr: String::new(),
+            });
+        }
+
+        if raw_input.eq_ignore_ascii_case(":reset") {
+            *self = Self::new();
+
+            return Ok(PrologResponse {
+                stdout: "Knowledge base cleared.".to_string(),
+                stderr: String::new(),
+            });
+        }
+
+        let force_load_mode = parse_load_command(&raw_input);
+        let is_force_load_mode = force_load_mode.is_some();
+
+        if let Some(load_payload) = force_load_mode {
+            if load_payload.is_empty() {
+                self.load_mode_armed = true;
+
+                return Ok(PrologResponse {
+                    stdout: "Load mode armed. Submit clauses next, or use `:load <clauses>` directly.".to_string(),
+                    stderr: String::new(),
+                });
+            }
+
+            raw_input = load_payload;
+        }
+
+        let load_mode_armed = self.load_mode_armed;
+
+        let (knowledge_text, inline_queries) = split_inline_queries(&raw_input);
+        let knowledge_candidate = knowledge_text.trim().to_string();
+        let has_knowledge = has_non_comment_content(&knowledge_candidate);
+        let has_inline_queries = !inline_queries.is_empty();
+        let should_load_knowledge = is_force_load_mode
+            || load_mode_armed
+            || looks_like_knowledge_block(&knowledge_candidate);
+
+        let knowledge_only_submission = should_load_knowledge && !has_inline_queries;
+
+        if knowledge_only_submission {
+            if !has_knowledge {
+                return Ok(PrologResponse {
+                    stdout: "No clauses found to load.".to_string(),
+                    stderr: String::new(),
+                });
+            }
+
+            let mut execution = self.run_scryer(&[knowledge_candidate.clone()], &[]);
+            if execution.success {
+                self.knowledge_blocks.push(knowledge_candidate.clone());
+                self.load_mode_armed = false;
+
+                let loaded_message = "Clauses loaded successfully.";
+
+                if execution.response.stdout.is_empty() {
+                    execution.response.stdout = loaded_message.to_string();
+                } else {
+                    execution.response.stdout =
+                        format!("{}\n{}", execution.response.stdout, loaded_message);
+                }
+            } else {
+                self.rebuild_machine();
+            }
+
+            return Ok(execution.response);
+        }
+
+        let goals = if has_inline_queries {
+            inline_queries
+        } else {
+            vec![normalize_goal(&raw_input).ok_or_else(|| "Query is empty".to_string())?]
+        };
+
+        let execution = if should_load_knowledge && has_knowledge {
+            self.run_scryer(&[knowledge_candidate.clone()], &goals)
+        } else {
+            self.run_scryer(&[], &goals)
+        };
+
+        if execution.success && should_load_knowledge && has_knowledge {
+            self.knowledge_blocks.push(knowledge_candidate.clone());
+            self.load_mode_armed = false;
+        }
+
+        if !execution.success && should_load_knowledge && has_knowledge {
+            self.rebuild_machine();
+        }
+
+        Ok(execution.response)
     }
 }
 
-fn run_scryer_inner(knowledge_blocks: &[String], goals: &[String]) -> PrologExecution {
-    let (streams, stdout_buffer, stderr_buffer) = make_capturing_streams();
-    let mut machine = MachineBuilder::default().with_streams(streams).build();
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    let mut stdout_offset = 0;
-    let mut stderr_offset = 0;
-    let mut success = true;
+fn prolog_worker_loop(receiver: mpsc::Receiver<WorkerRequest>) {
+    let mut engine = SessionEngine::new();
 
-    if !knowledge_blocks.is_empty() {
-        let consult_program = build_program_text(knowledge_blocks);
-        let consult_result = catch_unwind(AssertUnwindSafe(|| {
-            machine.consult_module_string("user", consult_program);
-        }));
+    while let Ok(request) = receiver.recv() {
+        match request {
+            WorkerRequest::Run { query, reply } => {
+                let result = catch_unwind(AssertUnwindSafe(|| engine.handle_query(query)));
+                let response = match result {
+                    Ok(response) => response,
+                    Err(_) => {
+                        engine = SessionEngine::new();
+                        Ok(prolog_panic_response().response)
+                    }
+                };
 
-        if consult_result.is_err() {
-            return PrologExecution {
-                response: PrologResponse {
-                    stdout: String::new(),
-                    stderr: "Scryer Prolog panicked while loading the current session knowledge."
-                        .to_string(),
-                },
-                success: false,
-            };
-        }
-
-        flush_machine_output(&mut machine);
-        append_output(
-            &mut stdout,
-            &capture_buffer_delta(&stdout_buffer, &mut stdout_offset),
-        );
-        append_output(
-            &mut stderr,
-            &capture_buffer_delta(&stderr_buffer, &mut stderr_offset),
-        );
-    }
-
-    for goal in goals {
-        let query_text = format!("once(({goal})).");
-        let query_result = catch_unwind(AssertUnwindSafe(|| {
-            let mut query = machine.run_query(query_text);
-            query.next().unwrap_or(Ok(LeafAnswer::False))
-        }));
-
-        let formatted_result = match query_result {
-            Ok(result) => format_leaf_answer(result),
-            Err(_) => (
-                Some(format!("Error: Scryer Prolog panicked while evaluating: {goal}")),
-                false,
-            ),
-        };
-
-        flush_machine_output(&mut machine);
-
-        append_output(
-            &mut stdout,
-            &capture_buffer_delta(&stdout_buffer, &mut stdout_offset),
-        );
-        append_output(
-            &mut stderr,
-            &capture_buffer_delta(&stderr_buffer, &mut stderr_offset),
-        );
-
-        if let Some(output_text) = formatted_result.0 {
-            if output_text.starts_with("Error:") || output_text.starts_with("Exception:") {
-                append_output(&mut stderr, &output_text);
-                success = false;
-            } else {
-                append_output(&mut stdout, &output_text);
-
-                if !formatted_result.1 {
-                    success = false;
-                }
+                let _ = reply.send(response);
             }
-        } else {
-            success = false;
         }
-    }
-
-    PrologExecution {
-        response: PrologResponse {
-            stdout: stdout.trim().to_string(),
-            stderr: stderr.trim().to_string(),
-        },
-        success,
     }
 }
 
 #[tauri::command]
 fn run_prolog_query(query: String) -> Result<PrologResponse, String> {
-    let mut raw_input = query.trim().to_string();
-    if raw_input.is_empty() {
-        return Err("Query is empty".to_string());
-    }
+    let (reply_tx, reply_rx) = mpsc::channel();
 
-    if raw_input.eq_ignore_ascii_case(":help") {
-        return Ok(PrologResponse {
-            stdout: build_help_message(),
-            stderr: String::new(),
-        });
-    }
+    prolog_worker()
+        .send(WorkerRequest::Run {
+            query,
+            reply: reply_tx,
+        })
+        .map_err(|_| "Failed to send query to the Prolog worker".to_string())?;
 
-    if raw_input.eq_ignore_ascii_case(":show") {
-        let state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-
-        return Ok(PrologResponse {
-            stdout: build_show_message_with_inputs(&state.knowledge_blocks, &state.successful_inputs),
-            stderr: String::new(),
-        });
-    }
-
-    if raw_input.eq_ignore_ascii_case(":clear") {
-        return Ok(PrologResponse {
-            stdout: String::new(),
-            stderr: String::new(),
-        });
-    }
-
-    if raw_input.eq_ignore_ascii_case(":reset") {
-        let mut state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-        state.knowledge_blocks.clear();
-        state.successful_inputs.clear();
-        state.load_mode_armed = false;
-
-        return Ok(PrologResponse {
-            stdout: "Knowledge base cleared.".to_string(),
-            stderr: String::new(),
-        });
-    }
-
-    let force_load_mode = parse_load_command(&raw_input);
-    let is_force_load_mode = force_load_mode.is_some();
-
-    if let Some(load_payload) = force_load_mode {
-        if load_payload.is_empty() {
-            let mut state = session_state()
-                .lock()
-                .map_err(|_| "Failed to acquire session lock".to_string())?;
-            state.load_mode_armed = true;
-
-            return Ok(PrologResponse {
-                stdout: "Load mode armed. Submit clauses next, or use `:load <clauses>` directly.".to_string(),
-                stderr: String::new(),
-            });
-        }
-
-        raw_input = load_payload;
-    }
-
-    let load_mode_armed = {
-        let state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-        state.load_mode_armed
-    };
-
-    let (knowledge_text, inline_queries) = split_inline_queries(&raw_input);
-    let knowledge_candidate = knowledge_text.trim().to_string();
-    let has_knowledge = has_non_comment_content(&knowledge_candidate);
-    let has_inline_queries = !inline_queries.is_empty();
-    let should_load_knowledge = is_force_load_mode
-        || load_mode_armed
-        || looks_like_knowledge_block(&knowledge_candidate);
-
-    let knowledge_only_submission = should_load_knowledge && !has_inline_queries;
-
-    if knowledge_only_submission {
-        if !has_knowledge {
-            return Ok(PrologResponse {
-                stdout: "No clauses found to load.".to_string(),
-                stderr: String::new(),
-            });
-        }
-
-        let mut execution = run_scryer(&[knowledge_candidate.clone()], &[]);
-        if execution.success {
-            let mut state = session_state()
-                .lock()
-                .map_err(|_| "Failed to acquire session lock".to_string())?;
-            state.knowledge_blocks.push(knowledge_candidate.clone());
-            state.load_mode_armed = false;
-            record_successful_inputs(&mut state, vec![knowledge_candidate.clone()]);
-
-            let loaded_message = "Clauses loaded successfully.";
-
-            if execution.response.stdout.is_empty() {
-                execution.response.stdout = loaded_message.to_string();
-            } else {
-                execution.response.stdout =
-                    format!("{}\n{}", execution.response.stdout, loaded_message);
-            }
-        }
-
-        return Ok(execution.response);
-    }
-
-    let goals = if has_inline_queries {
-        inline_queries
-    } else {
-        vec![normalize_goal(&raw_input).ok_or_else(|| "Query is empty".to_string())?]
-    };
-
-    let existing_knowledge = {
-        let state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-        state.knowledge_blocks.clone()
-    };
-
-    let mut candidate_knowledge = existing_knowledge;
-    if should_load_knowledge && has_knowledge {
-        candidate_knowledge.push(knowledge_candidate.clone());
-    }
-
-    let execution = run_scryer(&candidate_knowledge, &goals);
-
-    if execution.success && should_load_knowledge && has_knowledge {
-        let mut state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-        state.knowledge_blocks.push(knowledge_candidate.clone());
-        state.load_mode_armed = false;
-        record_successful_inputs(&mut state, vec![knowledge_candidate.clone()]);
-    }
-
-    if execution.success && !goals.is_empty() {
-        let mut state = session_state()
-            .lock()
-            .map_err(|_| "Failed to acquire session lock".to_string())?;
-        record_successful_inputs(
-            &mut state,
-            goals.iter().map(|goal| format!("?- {goal}")).collect(),
-        );
-    }
-
-    Ok(execution.response)
+    reply_rx
+        .recv()
+        .map_err(|_| "Failed to receive a response from the Prolog worker".to_string())?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -571,14 +576,9 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_help_message, build_show_message_with_inputs, looks_like_knowledge_block,
-        normalize_goal, parse_load_command, run_prolog_query, session_state, split_inline_queries,
+        build_help_message, build_show_message, looks_like_knowledge_block, normalize_goal,
+        parse_load_command, run_prolog_query, split_inline_queries,
     };
-
-    fn reset_session_state() {
-        let mut state = session_state().lock().expect("session lock");
-        *state = Default::default();
-    }
 
     #[test]
     fn normalizes_goal_prefix_and_trailing_dot() {
@@ -632,34 +632,32 @@ mod tests {
 
     #[test]
     fn show_message_reports_loaded_rules() {
-        let message = build_show_message_with_inputs(
-            &["bird(sparrow).".to_string(), "bird(sparrow).".to_string(), "flies(X) :- bird(X).".to_string()],
-            &["?- can_the_bird_fly(sparrow).".to_string(), "?- can_the_bird_fly(sparrow).".to_string()],
-        );
+        let message = build_show_message(&[
+            "bird(sparrow).".to_string(),
+            "bird(sparrow).".to_string(),
+            "flies(X) :- bird(X).".to_string(),
+        ]);
         assert!(message.contains("bird(sparrow)."));
         assert!(message.contains("flies(X) :- bird(X)."));
-        assert!(message.contains("Successful inputs:"));
         assert_eq!(message.matches("bird(sparrow)." ).count(), 1);
-        assert_eq!(message.matches("?- can_the_bird_fly(sparrow)." ).count(), 1);
     }
 
     #[test]
-    fn bare_equality_queries_stay_out_of_loaded_knowledge() {
-        reset_session_state();
+    fn bare_equality_queries_do_not_load_rules() {
+        let _ = run_prolog_query(":reset".to_string()).expect("reset should succeed");
 
-        let _response = run_prolog_query("1=1".to_string()).expect("bare equality should run");
-        let state = session_state().lock().expect("session lock");
+        let _ = run_prolog_query("1=1".to_string()).expect("bare equality should run");
+        let show = run_prolog_query(":show".to_string()).expect("show should succeed");
 
-        assert!(state.knowledge_blocks.is_empty());
+        assert!(show.stdout.contains("No rules loaded."));
     }
 
     #[test]
     fn malformed_queries_do_not_panic() {
-        reset_session_state();
+        let _ = run_prolog_query(":reset".to_string()).expect("reset should succeed");
 
-        let _ = run_prolog_query("foo(".to_string());
-        let state = session_state().lock().expect("session lock");
+        let response = run_prolog_query("foo(".to_string()).expect("malformed input should be contained");
 
-        assert!(state.knowledge_blocks.is_empty());
+        assert!(!response.stderr.is_empty());
     }
 }
