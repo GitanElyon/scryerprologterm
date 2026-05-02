@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::Cursor;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
@@ -151,10 +152,11 @@ fn dedupe_preserving_order<I>(values: I) -> Vec<String>
 where
     I: IntoIterator<Item = String>,
 {
+    let mut seen = HashSet::new();
     let mut unique_values = Vec::new();
 
     for value in values {
-        if !unique_values.contains(&value) {
+        if seen.insert(value.clone()) {
             unique_values.push(value);
         }
     }
@@ -170,7 +172,12 @@ fn make_capturing_streams() -> (StreamConfig, Rc<RefCell<Vec<u8>>>, Rc<RefCell<V
         let stdout_buffer = Rc::clone(&stdout_buffer);
 
         Box::new(move |cursor: &mut Cursor<Vec<u8>>| {
-            *stdout_buffer.borrow_mut() = cursor.get_ref().clone();
+            let source = cursor.get_ref();
+            let mut buf = stdout_buffer.borrow_mut();
+            let old_len = buf.len();
+            if source.len() > old_len {
+                buf.extend_from_slice(&source[old_len..]);
+            }
         })
     };
 
@@ -178,7 +185,12 @@ fn make_capturing_streams() -> (StreamConfig, Rc<RefCell<Vec<u8>>>, Rc<RefCell<V
         let stderr_buffer = Rc::clone(&stderr_buffer);
 
         Box::new(move |cursor: &mut Cursor<Vec<u8>>| {
-            *stderr_buffer.borrow_mut() = cursor.get_ref().clone();
+            let source = cursor.get_ref();
+            let mut buf = stderr_buffer.borrow_mut();
+            let old_len = buf.len();
+            if source.len() > old_len {
+                buf.extend_from_slice(&source[old_len..]);
+            }
         })
     };
 
@@ -205,7 +217,7 @@ fn append_output(target: &mut String, chunk: &str) {
     target.push_str(chunk);
 }
 
-fn format_atom(atom: &str) -> String {
+fn format_atom_to(atom: &str, buf: &mut String) {
     let is_bare_atom = atom
         .chars()
         .next()
@@ -215,38 +227,58 @@ fn format_atom(atom: &str) -> String {
         });
 
     if is_bare_atom {
-        atom.to_string()
+        buf.push_str(atom);
     } else {
-        format!("'{}'", atom.replace('\'', "''"))
+        buf.push('\'');
+        for c in atom.chars() {
+            if c == '\'' {
+                buf.push_str("''");
+            } else {
+                buf.push(c);
+            }
+        }
+        buf.push('\'');
     }
 }
 
-fn format_term(term: &Term) -> String {
+fn format_term_to(term: &Term, buf: &mut String) {
     match term {
-        Term::Integer(value) => value.to_string(),
-        Term::Rational(value) => value.to_string(),
-        Term::Float(value) => value.to_string(),
-        Term::Atom(value) => format_atom(value),
-        Term::String(value) => format!("\"{}\"", value.escape_default()),
+        Term::Integer(value) => buf.push_str(&value.to_string()),
+        Term::Rational(value) => buf.push_str(&value.to_string()),
+        Term::Float(value) => buf.push_str(&value.to_string()),
+        Term::Atom(value) => format_atom_to(value, buf),
+        Term::String(value) => {
+            buf.push('"');
+            buf.push_str(&value.escape_default().to_string());
+            buf.push('"');
+        }
         Term::List(items) => {
-            let formatted_items = items.iter().map(format_term).collect::<Vec<_>>().join(", ");
-            format!("[{}]", formatted_items)
+            buf.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    buf.push_str(", ");
+                }
+                format_term_to(item, buf);
+            }
+            buf.push(']');
         }
         Term::Compound(functor, arguments) => {
-            let formatted_arguments = arguments
-                .iter()
-                .map(format_term)
-                .collect::<Vec<_>>()
-                .join(", ");
-
-            if formatted_arguments.is_empty() {
-                format_atom(functor)
+            if arguments.is_empty() {
+                format_atom_to(functor, buf);
             } else {
-                format!("{}({})", format_atom(functor), formatted_arguments)
+                format_atom_to(functor, buf);
+                buf.push('(');
+                for (i, arg) in arguments.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    format_term_to(arg, buf);
+                }
+                buf.push(')');
             }
         }
-        Term::Var(value) => value.clone(),
-        _ => format!("{:?}", term),
+        Term::Var(value) => buf.push_str(value),
+        _ => buf.push_str(&format!("{:?}", term)),
     }
 }
 
@@ -254,24 +286,32 @@ fn format_leaf_answer(answer: Result<LeafAnswer, Term>) -> (Option<String>, bool
     match answer {
         Ok(LeafAnswer::True) => (Some("true.".to_string()), true),
         Ok(LeafAnswer::False) => (Some("false.".to_string()), true),
-        Ok(LeafAnswer::Exception(term)) => (
-            Some(format!("Exception: {}", format_term(&term))),
-            false,
-        ),
+        Ok(LeafAnswer::Exception(term)) => {
+            let mut buf = String::from("Exception: ");
+            format_term_to(&term, &mut buf);
+            (Some(buf), false)
+        }
         Ok(LeafAnswer::LeafAnswer { bindings, .. }) => {
             if bindings.is_empty() {
                 (Some("true.".to_string()), true)
             } else {
-                let formatted_bindings = bindings
-                    .iter()
-                    .map(|(name, value)| format!("{} = {}", name, format_term(value)))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-
-                (Some(formatted_bindings), true)
+                let mut buf = String::with_capacity(128);
+                for (i, (name, value)) in bindings.iter().enumerate() {
+                    if i > 0 {
+                        buf.push_str(", ");
+                    }
+                    buf.push_str(name);
+                    buf.push_str(" = ");
+                    format_term_to(value, &mut buf);
+                }
+                (Some(buf), true)
             }
         }
-        Err(term) => (Some(format!("Error: {}", format_term(&term))), false),
+        Err(term) => {
+            let mut buf = String::from("Error: ");
+            format_term_to(&term, &mut buf);
+            (Some(buf), false)
+        }
     }
 }
 
@@ -312,16 +352,16 @@ impl SessionEngine {
 
     fn rebuild_machine(&mut self) {
         let load_mode_armed = self.load_mode_armed;
-        let knowledge_blocks = self.knowledge_blocks.clone();
+        let knowledge_blocks = std::mem::take(&mut self.knowledge_blocks);
 
         *self = Self::new();
-        self.knowledge_blocks = knowledge_blocks.clone();
         self.load_mode_armed = load_mode_armed;
 
-        for block in knowledge_blocks {
-            let _ = self.run_scryer(&[block], &[]);
+        for block in &knowledge_blocks {
+            let _ = self.run_scryer(std::slice::from_ref(block), &[]);
         }
 
+        self.knowledge_blocks = knowledge_blocks;
         self.load_mode_armed = load_mode_armed;
     }
 
@@ -411,9 +451,16 @@ impl SessionEngine {
     }
 
     fn handle_query(&mut self, query: String) -> Result<PrologResponse, String> {
-        let mut raw_input = query.trim().to_string();
+        let raw_input = query.trim();
         if raw_input.is_empty() {
             return Err("Query is empty".to_string());
+        }
+
+        if raw_input.eq_ignore_ascii_case(":boot") {
+            return Ok(PrologResponse {
+                stdout: String::new(),
+                stderr: String::new(),
+            });
         }
 
         if raw_input.eq_ignore_ascii_case(":help") {
@@ -446,8 +493,7 @@ impl SessionEngine {
             });
         }
 
-        let force_load_mode = parse_load_command(&raw_input);
-        let is_force_load_mode = force_load_mode.is_some();
+        let force_load_mode = parse_load_command(raw_input);
 
         if let Some(load_payload) = force_load_mode {
             if load_payload.is_empty() {
@@ -459,18 +505,22 @@ impl SessionEngine {
                 });
             }
 
-            raw_input = load_payload;
+            return self.execute_submission(&load_payload, true);
         }
 
+        self.execute_submission(raw_input, false)
+    }
+
+    fn execute_submission(&mut self, input: &str, is_force_load_mode: bool) -> Result<PrologResponse, String> {
         let load_mode_armed = self.load_mode_armed;
 
-        let (knowledge_text, inline_queries) = split_inline_queries(&raw_input);
-        let knowledge_candidate = knowledge_text.trim().to_string();
-        let has_knowledge = has_non_comment_content(&knowledge_candidate);
+        let (knowledge_text, inline_queries) = split_inline_queries(input);
+        let knowledge_candidate = knowledge_text.trim();
+        let has_knowledge = has_non_comment_content(knowledge_candidate);
         let has_inline_queries = !inline_queries.is_empty();
         let should_load_knowledge = is_force_load_mode
             || load_mode_armed
-            || looks_like_knowledge_block(&knowledge_candidate);
+            || looks_like_knowledge_block(knowledge_candidate);
 
         let knowledge_only_submission = should_load_knowledge && !has_inline_queries;
 
@@ -482,9 +532,10 @@ impl SessionEngine {
                 });
             }
 
-            let mut execution = self.run_scryer(&[knowledge_candidate.clone()], &[]);
+            let knowledge_owned = knowledge_candidate.to_string();
+            let mut execution = self.run_scryer(std::slice::from_ref(&knowledge_owned), &[]);
             if execution.success {
-                self.knowledge_blocks.push(knowledge_candidate.clone());
+                self.knowledge_blocks.push(knowledge_owned);
                 self.load_mode_armed = false;
 
                 let loaded_message = "Clauses loaded successfully.";
@@ -505,17 +556,17 @@ impl SessionEngine {
         let goals = if has_inline_queries {
             inline_queries
         } else {
-            vec![normalize_goal(&raw_input).ok_or_else(|| "Query is empty".to_string())?]
+            vec![normalize_goal(input).ok_or_else(|| "Query is empty".to_string())?]
         };
 
         let execution = if should_load_knowledge && has_knowledge {
-            self.run_scryer(&[knowledge_candidate.clone()], &goals)
+            self.run_scryer(&[knowledge_candidate.to_string()], &goals)
         } else {
             self.run_scryer(&[], &goals)
         };
 
         if execution.success && should_load_knowledge && has_knowledge {
-            self.knowledge_blocks.push(knowledge_candidate.clone());
+            self.knowledge_blocks.push(knowledge_candidate.to_string());
             self.load_mode_armed = false;
         }
 

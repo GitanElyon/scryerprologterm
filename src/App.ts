@@ -143,9 +143,13 @@ export default {
 
     watch(query, resizeComposer);
 
-    onMounted(() => {
+    onMounted(async () => {
       resizeComposer();
       resetComposerHeight();
+
+      pushEntry("system", "Scryer Prolog Terminal - Type :help for available commands");
+      // Send a ping query to warm up the engine
+      await invoke("run_prolog_query", { query: ":boot" }).catch(() => {});
     });
 
     return {
